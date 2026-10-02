@@ -1,0 +1,180 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment per branch at a time, and never cancel one that is half way through.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  SITE_NAME: LendingApi
+  SITE_PORT: 8085
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "1.0.${{ github.run_number }}"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $version"
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Check for vulnerable packages
+        shell: pwsh
+        run: |
+          $report = dotnet list package --vulnerable --include-transitive | Out-String
+          Write-Host $report
+          if ($report -match 'has the following vulnerable packages') {
+            throw 'Vulnerable NuGet packages found.'
+          }
+
+      - name: Build
+        run: dotnet build -c Release --no-restore -p:Version=${{ steps.version.outputs.version }}
+
+      - name: Test
+        run: dotnet test -c Release --no-build --logger trx --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults
+          if-no-files-found: ignore
+
+      - name: Publish
+        run: dotnet publish src/LendingApi -c Release --no-build -p:Version=${{ steps.version.outputs.version }} -o publish
+
+      # The package is built once here. Every environment deploys this same file.
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release | Out-Null
+          Compress-Archive -Path publish/* -DestinationPath "release/LendingApi-${{ steps.version.outputs.version }}.zip"
+          Copy-Item -Path deploy -Destination release/deploy -Recurse
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release
+          if-no-files-found: error
+
+  # Deploys to IIS on the GitHub-hosted Windows runner. The runner is thrown away after
+  # the job, so this proves the package and the deployment scripts work on a clean machine.
+  deploy-test:
+    name: Deploy to IIS (test)
+    needs: build
+    runs-on: windows-latest
+    environment: test
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download release package
+        uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+
+      - name: Install IIS prerequisites
+        shell: powershell
+        run: ./release/deploy/Install-Prerequisites.ps1
+
+      - name: Deploy and verify
+        shell: powershell
+        run: |
+          ./release/deploy/Deploy-IisSite.ps1 `
+            -PackagePath "release/LendingApi-$env:VERSION.zip" `
+            -Version $env:VERSION `
+            -SiteName $env:SITE_NAME `
+            -Port $env:SITE_PORT `
+            -Environment Test
+
+      - name: Call the API through IIS
+        shell: powershell
+        run: |
+          $loans = Invoke-RestMethod "http://localhost:$env:SITE_PORT/api/loans"
+          $loans | Format-Table borrower, principal, currency, termMonths
+          if (@($loans).Count -lt 2) { throw 'Expected the seeded loans.' }
+
+      - name: Verify automatic rollback
+        shell: powershell
+        run: |
+          ./release/deploy/Test-Rollback.ps1 `
+            -PackagePath "release/LendingApi-$env:VERSION.zip" `
+            -GoodVersion $env:VERSION `
+            -SiteName $env:SITE_NAME `
+            -Port $env:SITE_PORT `
+            -Environment Test
+
+      - name: Show deployment log
+        if: always()
+        shell: powershell
+        run: |
+          $log = "C:\inetpub\sites\$env:SITE_NAME\deployments.log"
+          if (Test-Path $log) { Get-Content $log }
+
+      - name: Show IIS and .NET errors
+        if: failure()
+        shell: powershell
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1, 2, 3 } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, ProviderName, Message
+
+  # Deploys the same package to a real IIS server through a self-hosted runner installed
+  # on that server. Skipped until a runner is registered and the repository variable
+  # PRODUCTION_RUNNER_READY is set to "true". Add required reviewers to the "production"
+  # environment to get a manual approval before this job starts.
+  deploy-production:
+    name: Deploy to IIS (production)
+    needs: [build, deploy-test]
+    if: github.ref == 'refs/heads/main' && vars.PRODUCTION_RUNNER_READY == 'true'
+    runs-on: [self-hosted, windows, iis]
+    environment: production
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download release package
+        uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+
+      - name: Install IIS prerequisites
+        shell: powershell
+        run: ./release/deploy/Install-Prerequisites.ps1
+
+      - name: Deploy and verify
+        shell: powershell
+        run: |
+          ./release/deploy/Deploy-IisSite.ps1 `
+            -PackagePath "release/LendingApi-$env:VERSION.zip" `
+            -Version $env:VERSION `
+            -SiteName $env:SITE_NAME `
+            -Port $env:SITE_PORT `
+            -Environment Production
