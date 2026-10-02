@@ -1,16 +1,35 @@
 using System.Collections.Concurrent;
+using LendingApi.Data;
+using Microsoft.EntityFrameworkCore;
 
 namespace LendingApi.Loans;
 
 public interface ILoanStore
 {
-    IReadOnlyCollection<Loan> GetAll();
-    Loan? Get(Guid id);
-    Loan Add(CreateLoanRequest request);
+    Task<IReadOnlyCollection<Loan>> GetAllAsync(CancellationToken ct);
+    Task<Loan?> GetAsync(Guid id, CancellationToken ct);
+    Task<Loan> AddAsync(CreateLoanRequest request, CancellationToken ct);
 }
 
-// In-memory store to keep the sample focused on build, release and deployment.
-// Data is lost when the app pool recycles.
+// Used in every deployed environment. The schema is owned by the scripts in db/migrations.
+public class SqlLoanStore(LendingDbContext db) : ILoanStore
+{
+    public async Task<IReadOnlyCollection<Loan>> GetAllAsync(CancellationToken ct) =>
+        await db.Loans.AsNoTracking().OrderBy(l => l.CreatedAt).ToListAsync(ct);
+
+    public Task<Loan?> GetAsync(Guid id, CancellationToken ct) =>
+        db.Loans.AsNoTracking().FirstOrDefaultAsync(l => l.Id == id, ct);
+
+    public async Task<Loan> AddAsync(CreateLoanRequest request, CancellationToken ct)
+    {
+        var loan = Loan.Create(request);
+        db.Loans.Add(loan);
+        await db.SaveChangesAsync(ct);
+        return loan;
+    }
+}
+
+// Used for local development and the tests, so neither needs a database.
 public class InMemoryLoanStore : ILoanStore
 {
     private readonly ConcurrentDictionary<Guid, Loan> _loans = new();
@@ -21,20 +40,16 @@ public class InMemoryLoanStore : ILoanStore
         Add(new CreateLoanRequest("Fjord Energy AB", 8_500_000m, "SEK", 36));
     }
 
-    public IReadOnlyCollection<Loan> GetAll() => _loans.Values.OrderBy(l => l.CreatedAt).ToList();
+    public Task<IReadOnlyCollection<Loan>> GetAllAsync(CancellationToken ct) =>
+        Task.FromResult<IReadOnlyCollection<Loan>>(_loans.Values.OrderBy(l => l.CreatedAt).ToList());
 
-    public Loan? Get(Guid id) => _loans.GetValueOrDefault(id);
+    public Task<Loan?> GetAsync(Guid id, CancellationToken ct) => Task.FromResult(_loans.GetValueOrDefault(id));
 
-    public Loan Add(CreateLoanRequest request)
+    public Task<Loan> AddAsync(CreateLoanRequest request, CancellationToken ct) => Task.FromResult(Add(request));
+
+    private Loan Add(CreateLoanRequest request)
     {
-        var loan = new Loan(
-            Guid.NewGuid(),
-            request.Borrower.Trim(),
-            request.Principal,
-            string.IsNullOrWhiteSpace(request.Currency) ? "NOK" : request.Currency.Trim().ToUpperInvariant(),
-            request.TermMonths,
-            DateTimeOffset.UtcNow);
-
+        var loan = Loan.Create(request);
         _loans[loan.Id] = loan;
         return loan;
     }

@@ -11,36 +11,46 @@
     The IIS site is then pointed at that folder. The previous release stays on disk, so a
     rollback is only a matter of pointing the site back at it.
 
+    The same package is deployed to every environment. What differs per environment comes
+    from two places, both applied at deploy time:
+      - environments\<EnvironmentName>.psd1  settings that are not secret
+      - -ConnectionString                    the secret, supplied by the pipeline
+
     Steps:
       1. Unpack the package into a new release folder
-      2. Set the environment name in the release's web.config
-      3. Create the app pool and site if they do not exist
-      4. Point the site at the new release and restart the app pool
-      5. Verify /health and /version
-      6. Roll back to the previous release if verification fails
-      7. Remove old releases and write a line to the deployment log
+      2. Write the environment's settings and connection string into the release's web.config
+      3. Create the app pool if it does not exist
+      4. Back up and migrate the database (see Invoke-DbMigrations.ps1)
+      5. Point the site at the new release and restart the app pool
+      6. Verify /health and /version
+      7. Roll back to the previous release if verification fails
+      8. Remove old releases and write a line to the deployment log
 
     To roll back by hand, run the script with -Version set to a release that is still on
-    the server and leave out -PackagePath.
+    the server and leave out -PackagePath and -ConnectionString.
 
 .EXAMPLE
-    .\Deploy-IisSite.ps1 -PackagePath .\LendingApi-1.0.42.zip -Version 1.0.42 -Environment Test
+    .\Deploy-IisSite.ps1 -PackagePath .\LendingApi-1.0.42.zip -Version 1.0.42 -EnvironmentName uat `
+        -ConnectionString 'Server=SQL01;Database=LendingDb;Integrated Security=true;TrustServerCertificate=true'
 
 .EXAMPLE
-    .\Deploy-IisSite.ps1 -Version 1.0.41 -Environment Test
+    .\Deploy-IisSite.ps1 -Version 1.0.41 -EnvironmentName uat
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
     [string]$Version,
 
+    # Name of a file in the environments folder: dev, uat, preprod or prod.
+    [Parameter(Mandatory)]
+    [string]$EnvironmentName,
+
     [string]$PackagePath,
 
-    [string]$SiteName = 'LendingApi',
+    [string]$ConnectionString,
 
-    [int]$Port = 8085,
-
-    [string]$Environment = 'Production',
+    # Default: db\migrations next to the deploy folder.
+    [string]$MigrationsPath,
 
     [string]$SitesRoot = 'C:\inetpub\sites',
 
@@ -52,24 +62,37 @@ $ProgressPreference = 'SilentlyContinue'
 
 Import-Module WebAdministration
 
-$siteRoot = Join-Path $SitesRoot $SiteName
+$environmentFile = Join-Path $PSScriptRoot "environments\$EnvironmentName.psd1"
+if (-not (Test-Path $environmentFile)) {
+    $known = (Get-ChildItem (Join-Path $PSScriptRoot 'environments') -Filter '*.psd1').BaseName -join ', '
+    throw "Unknown environment '$EnvironmentName'. Known environments: $known."
+}
+$environment = Import-PowerShellDataFile -Path $environmentFile
+
+$siteName = $environment.SiteName
+$port = $environment.Port
+$aspNetCoreEnvironment = $environment.AspNetCoreEnvironment
+
+$siteRoot = Join-Path $SitesRoot $siteName
 $releasesRoot = Join-Path $siteRoot 'releases'
 $releasePath = Join-Path $releasesRoot $Version
-$appPoolName = $SiteName
-$sitePath = "IIS:\Sites\$SiteName"
+$appPoolName = $siteName
+$sitePath = "IIS:\Sites\$siteName"
 $appPoolPath = "IIS:\AppPools\$appPoolName"
-$baseUrl = "http://localhost:$Port"
+$baseUrl = "http://localhost:$port"
+$schemaVersion = '-'
 
 function Write-Step([string]$Message) {
     Write-Host "==> $Message"
 }
 
 function Write-DeploymentLog([string]$Result) {
-    $line = '{0:u} | {1} | {2} | {3} | {4}\{5}' -f (Get-Date).ToUniversalTime(), $Version, $Environment, $Result, $env:USERDOMAIN, $env:USERNAME
+    $line = '{0:u} | {1} | {2} | schema {3} | {4} | {5}\{6}' -f (Get-Date).ToUniversalTime(), $Version, $EnvironmentName, $schemaVersion, $Result, $env:USERDOMAIN, $env:USERNAME
     Add-Content -Path (Join-Path $siteRoot 'deployments.log') -Value $line
 }
 
-function Set-AspNetCoreEnvironment([string]$WebConfigPath, [string]$Name) {
+# Writes settings as environment variables of the app, in the release's web.config.
+function Set-AppEnvironmentVariables([string]$WebConfigPath, [hashtable]$Variables) {
     $xml = New-Object System.Xml.XmlDocument
     $xml.Load($WebConfigPath)
 
@@ -78,20 +101,22 @@ function Set-AspNetCoreEnvironment([string]$WebConfigPath, [string]$Name) {
         throw "No <aspNetCore> element found in $WebConfigPath."
     }
 
-    $variables = $aspNetCore.SelectSingleNode('environmentVariables')
-    if (-not $variables) {
-        $variables = $xml.CreateElement('environmentVariables')
-        [void]$aspNetCore.AppendChild($variables)
+    $container = $aspNetCore.SelectSingleNode('environmentVariables')
+    if (-not $container) {
+        $container = $xml.CreateElement('environmentVariables')
+        [void]$aspNetCore.AppendChild($container)
     }
 
-    $variable = $variables.SelectSingleNode("environmentVariable[@name='ASPNETCORE_ENVIRONMENT']")
-    if (-not $variable) {
-        $variable = $xml.CreateElement('environmentVariable')
-        $variable.SetAttribute('name', 'ASPNETCORE_ENVIRONMENT')
-        [void]$variables.AppendChild($variable)
+    foreach ($name in $Variables.Keys) {
+        $variable = $container.SelectSingleNode("environmentVariable[@name='$name']")
+        if (-not $variable) {
+            $variable = $xml.CreateElement('environmentVariable')
+            $variable.SetAttribute('name', $name)
+            [void]$container.AppendChild($variable)
+        }
+        $variable.SetAttribute('value', [string]$Variables[$name])
     }
 
-    $variable.SetAttribute('value', $Name)
     $xml.Save($WebConfigPath)
 }
 
@@ -109,8 +134,8 @@ function Restart-AppPool {
 function Test-Deployment([string]$ExpectedVersion, [int]$Attempts = 15, [int]$DelaySeconds = 2) {
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         try {
-            $health = Invoke-WebRequest -Uri "$baseUrl/health" -UseBasicParsing -TimeoutSec 15
-            $info = Invoke-RestMethod -Uri "$baseUrl/version" -TimeoutSec 15
+            $health = Invoke-WebRequest -Uri "$baseUrl/health" -UseBasicParsing -TimeoutSec 30
+            $info = Invoke-RestMethod -Uri "$baseUrl/version" -TimeoutSec 30
             # The build stamps the version as "<version>+<commit sha>".
             $runningVersion = ($info.version -split '\+')[0]
 
@@ -119,11 +144,11 @@ function Test-Deployment([string]$ExpectedVersion, [int]$Attempts = 15, [int]$De
                     Write-Host "    Healthy, running $runningVersion ($($info.environment))."
                     return $true
                 }
-                if ($runningVersion -eq $ExpectedVersion -and $info.environment -eq $Environment) {
-                    Write-Host "    Healthy, running $($info.version) ($($info.environment)) on $($info.machine)."
+                if ($runningVersion -eq $ExpectedVersion -and $info.environment -eq $aspNetCoreEnvironment) {
+                    Write-Host "    Healthy, running $($info.version) ($($info.environment), $($info.storage)) on $($info.machine)."
                     return $true
                 }
-                Write-Host "    Attempt $attempt/${Attempts}: running $runningVersion ($($info.environment)), expected $ExpectedVersion ($Environment)."
+                Write-Host "    Attempt $attempt/${Attempts}: running $runningVersion ($($info.environment)), expected $ExpectedVersion ($aspNetCoreEnvironment)."
             }
         }
         catch {
@@ -138,13 +163,16 @@ function Test-Deployment([string]$ExpectedVersion, [int]$Attempts = 15, [int]$De
 
 $currentPath = $null
 if (Test-Path $sitePath) {
-    $site = Get-Website | Where-Object { $_.Name -eq $SiteName }
+    $site = Get-Website | Where-Object { $_.Name -eq $siteName }
     $currentPath = [Environment]::ExpandEnvironmentVariables($site.physicalPath)
 }
 
 if ($PackagePath) {
     if (-not (Test-Path $PackagePath)) {
         throw "Package not found: $PackagePath"
+    }
+    if (-not $ConnectionString) {
+        throw 'A new release needs -ConnectionString.'
     }
     if ($currentPath -eq $releasePath) {
         throw "Release $Version is the one currently live. Build a new version instead of overwriting it."
@@ -167,10 +195,17 @@ else {
 
 # --- 2. Configuration ------------------------------------------------------------------
 
-Write-Step "Setting environment to $Environment"
-Set-AspNetCoreEnvironment -WebConfigPath (Join-Path $releasePath 'web.config') -Name $Environment
+Write-Step "Applying settings for environment '$EnvironmentName'"
+$variables = @{ ASPNETCORE_ENVIRONMENT = $aspNetCoreEnvironment }
+foreach ($name in $environment.Settings.Keys) {
+    $variables[$name] = $environment.Settings[$name]
+}
+if ($ConnectionString) {
+    $variables['ConnectionStrings__LendingDb'] = $ConnectionString
+}
+Set-AppEnvironmentVariables -WebConfigPath (Join-Path $releasePath 'web.config') -Variables $variables
 
-# --- 3. App pool and site --------------------------------------------------------------
+# --- 3. App pool -----------------------------------------------------------------------
 
 if (-not (Test-Path $appPoolPath)) {
     Write-Step "Creating app pool $appPoolName"
@@ -185,31 +220,51 @@ if ($LASTEXITCODE -ne 0) {
     throw "Could not grant the app pool identity access to $siteRoot."
 }
 
-# --- 4. Switch -------------------------------------------------------------------------
+# --- 4. Database -----------------------------------------------------------------------
+
+if ($ConnectionString) {
+    Write-Step 'Migrating the database'
+    $migrationArguments = @{ ConnectionString = $ConnectionString }
+    if ($MigrationsPath) {
+        $migrationArguments.MigrationsPath = $MigrationsPath
+    }
+    # With Windows authentication the app connects as the app pool identity, so there is
+    # no database password to store. That identity gets read and write access only.
+    if ((New-Object System.Data.SqlClient.SqlConnectionStringBuilder $ConnectionString).psbase.IntegratedSecurity) {
+        $migrationArguments.AppLogin = "IIS APPPOOL\$appPoolName"
+    }
+    $migration = & (Join-Path $PSScriptRoot 'Invoke-DbMigrations.ps1') @migrationArguments
+    $schemaVersion = $migration.SchemaVersion
+    Write-Host "    Schema version $schemaVersion."
+}
+
+# --- 5. Switch -------------------------------------------------------------------------
 
 if ($currentPath) {
-    Write-Step "Switching site $SiteName from $currentPath to $releasePath"
+    Write-Step "Switching site $siteName from $currentPath to $releasePath"
     Set-ItemProperty -Path $sitePath -Name physicalPath -Value $releasePath
 }
 else {
-    Write-Step "Creating site $SiteName on port $Port"
-    New-Website -Name $SiteName -Port $Port -PhysicalPath $releasePath -ApplicationPool $appPoolName | Out-Null
+    Write-Step "Creating site $siteName on port $port"
+    New-Website -Name $siteName -Port $port -PhysicalPath $releasePath -ApplicationPool $appPoolName | Out-Null
 }
 
 Restart-AppPool
-if ((Get-WebsiteState -Name $SiteName).Value -ne 'Started') {
-    Start-Website -Name $SiteName
+if ((Get-WebsiteState -Name $siteName).Value -ne 'Started') {
+    Start-Website -Name $siteName
 }
 
-# --- 5. Verify -------------------------------------------------------------------------
+# --- 6. Verify -------------------------------------------------------------------------
 
 Write-Step "Verifying $baseUrl"
 $verified = Test-Deployment -ExpectedVersion $Version
 
-# --- 6. Roll back on failure -----------------------------------------------------------
+# --- 7. Roll back on failure -----------------------------------------------------------
 
 if (-not $verified) {
     if ($currentPath -and $currentPath -ne $releasePath) {
+        # Only the code is rolled back. Migrations are backward compatible, so the
+        # previous release keeps working against the newer schema.
         Write-Warning "Verification failed. Rolling back to $currentPath"
         Set-ItemProperty -Path $sitePath -Name physicalPath -Value $currentPath
         Restart-AppPool
@@ -226,7 +281,7 @@ if (-not $verified) {
     throw "Release $Version failed verification and there is no previous release to roll back to."
 }
 
-# --- 7. Clean up and record ------------------------------------------------------------
+# --- 8. Clean up and record ------------------------------------------------------------
 
 $keep = @($releasePath, $currentPath)
 Get-ChildItem -Path $releasesRoot -Directory |

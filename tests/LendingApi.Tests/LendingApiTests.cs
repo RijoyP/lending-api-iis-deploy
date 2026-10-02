@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using LendingApi.Loans;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 
 namespace LendingApi.Tests;
@@ -11,7 +12,10 @@ public class LendingApiTests : IClassFixture<WebApplicationFactory<Program>>
 
     public LendingApiTests(WebApplicationFactory<Program> factory)
     {
-        _client = factory.CreateClient();
+        // The tests run without a database.
+        _client = factory
+            .WithWebHostBuilder(builder => builder.UseSetting("Storage:Provider", "InMemory"))
+            .CreateClient();
     }
 
     [Fact]
@@ -53,6 +57,7 @@ public class LendingApiTests : IClassFixture<WebApplicationFactory<Program>>
         var loan = await created.Content.ReadFromJsonAsync<Loan>();
         Assert.NotNull(loan);
         Assert.Equal("NOK", loan.Currency);
+        Assert.Equal("Active", loan.Status);
 
         var fetched = await _client.GetFromJsonAsync<Loan>($"/api/loans/{loan.Id}");
         Assert.Equal(loan, fetched);

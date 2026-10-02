@@ -1,0 +1,107 @@
+name: Deploy
+
+# Deploys one release package to one environment. Called once per environment by ci-cd.yml,
+# so every environment is deployed in exactly the same way.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev, uat, preprod or prod. Matches a file in deploy/environments and a GitHub environment.
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      runner:
+        description: Use a self-hosted runner label to deploy to a real IIS server.
+        type: string
+        default: windows-latest
+      test-rollback:
+        description: Also deploy a broken package to prove the automatic rollback.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to IIS (${{ inputs.environment }})
+    runs-on: ${{ inputs.runner }}
+    # Approvals and secrets are configured per GitHub environment.
+    environment: ${{ inputs.environment }}
+    env:
+      VERSION: ${{ inputs.version }}
+      ENVIRONMENT_NAME: ${{ inputs.environment }}
+      SITE_URL: http://localhost:8085
+    steps:
+      - name: Download release package
+        uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+
+      - name: Install IIS prerequisites
+        shell: powershell
+        run: ./release/deploy/Install-Prerequisites.ps1
+
+      # A real environment has its own SQL Server and a DB_CONNECTION_STRING secret.
+      # Without the secret, the job uses a LocalDB instance on the runner instead.
+      - name: Resolve database connection
+        shell: powershell
+        env:
+          DB_SECRET: ${{ secrets.DB_CONNECTION_STRING }}
+        run: |
+          if ($env:DB_SECRET) {
+            Write-Host 'Using the DB_CONNECTION_STRING secret of this environment.'
+            $connectionString = $env:DB_SECRET
+          }
+          else {
+            Write-Host 'No DB_CONNECTION_STRING secret. Using LocalDB on the runner.'
+            ./release/deploy/ci/Start-LocalDb.ps1 -InstanceName LendingCi -SharedName LendingShared
+            $connectionString = "Server=(localdb)\.\LendingShared;Database=LendingDb_$env:ENVIRONMENT_NAME;Integrated Security=true;TrustServerCertificate=true"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "DB_CONNECTION_STRING=$connectionString"
+
+      - name: Migrate database, deploy and verify
+        shell: powershell
+        run: |
+          ./release/deploy/Deploy-IisSite.ps1 `
+            -PackagePath "release/LendingApi-$env:VERSION.zip" `
+            -Version $env:VERSION `
+            -EnvironmentName $env:ENVIRONMENT_NAME `
+            -ConnectionString $env:DB_CONNECTION_STRING
+
+      - name: Read and write through IIS
+        shell: powershell
+        run: |
+          $body = @{ borrower = "Pipeline check $env:VERSION"; principal = 1000; currency = 'NOK'; termMonths = 12 } | ConvertTo-Json
+          $created = Invoke-RestMethod "$env:SITE_URL/api/loans" -Method Post -ContentType 'application/json' -Body $body
+          $loans = @(Invoke-RestMethod "$env:SITE_URL/api/loans")
+          $loans | Format-Table borrower, principal, currency, termMonths, status
+          if ($loans.id -notcontains $created.id) { throw 'The loan that was just created is not in the database.' }
+
+      - name: Verify automatic rollback
+        if: inputs.test-rollback
+        shell: powershell
+        run: |
+          ./release/deploy/Test-Rollback.ps1 `
+            -PackagePath "release/LendingApi-$env:VERSION.zip" `
+            -GoodVersion $env:VERSION `
+            -EnvironmentName $env:ENVIRONMENT_NAME `
+            -ConnectionString $env:DB_CONNECTION_STRING
+
+      - name: Show deployment log
+        if: always()
+        shell: powershell
+        run: |
+          $log = 'C:\inetpub\sites\LendingApi\deployments.log'
+          if (Test-Path $log) { Get-Content $log }
+
+      - name: Show IIS and .NET errors
+        if: failure()
+        shell: powershell
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1, 2, 3 } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, ProviderName, Message
